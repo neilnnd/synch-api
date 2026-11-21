@@ -1,6 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { WebSocketServer, type WebSocket as WsWebSocket } from "ws";
+import { WebSocketServer } from "ws";
 
 import {
 	parseBearerToken,
@@ -75,6 +75,7 @@ export function createNodeWebSocketUpgradeHandler(runtime: NodeRuntime, publicUr
 				readSyncToken(request),
 				vaultId,
 			);
+			coordinator.socketConnectionService.assertSessionAccess(session);
 		} catch {
 			socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
 			socket.destroy();
@@ -86,8 +87,7 @@ export function createNodeWebSocketUpgradeHandler(runtime: NodeRuntime, publicUr
 			return;
 		}
 
-		wss.handleUpgrade(req, socket, head, (rawWs) => {
-			const ws = rawWs as WsWebSocket;
+		wss.handleUpgrade(req, socket, head, (ws) => {
 			const connectionId = coordinator.socketGateway.registerSocket(ws, session);
 
 			ws.on("message", (data, isBinary) => {
@@ -143,7 +143,7 @@ export function createNodeWebSocketUpgradeHandler(runtime: NodeRuntime, publicUr
 					console.error("[node-websocket] presence disconnect failed", error);
 				});
 				coordinator.socketGateway.unregisterSocket(ws);
-				track(coordinator.useCases.handleSocketClose()).catch((error: unknown) => {
+				track(coordinator.services.handleSocketClose()).catch((error: unknown) => {
 					console.error("[node-websocket] socket close handling failed", error);
 				});
 			};

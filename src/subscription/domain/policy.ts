@@ -1,11 +1,19 @@
 export const BYTES_PER_MB = 1_000_000;
 export const BYTES_PER_GB = 1_000_000_000;
 
-export const SUBSCRIPTION_PLAN_IDS = ["free", "starter", "self_hosted"] as const;
+export const SUBSCRIPTION_PLAN_IDS = [
+	"free",
+	"starter",
+	"plus",
+	"self_hosted",
+] as const;
 export const SUBSCRIPTION_BILLING_INTERVALS = ["monthly", "annual"] as const;
 
 export type SubscriptionPlanId = (typeof SUBSCRIPTION_PLAN_IDS)[number];
-export type PaidSubscriptionPlanId = Exclude<SubscriptionPlanId, "free" | "self_hosted">;
+export type PaidSubscriptionPlanId = Exclude<
+	SubscriptionPlanId,
+	"free" | "self_hosted"
+>;
 export type SubscriptionBillingInterval =
 	(typeof SUBSCRIPTION_BILLING_INTERVALS)[number];
 export type SubscriptionProductIdsByPlanId = Partial<
@@ -19,11 +27,6 @@ export type SubscriptionPlanPolicy = {
 	id: SubscriptionPlanId;
 	name: string;
 	badge?: string;
-	pricing: {
-		monthlyUsd: number;
-		annualMonthlyUsd: number;
-		annualUsd: number;
-	};
 	limits: {
 		syncedVaults: number;
 		storageLimitBytes: number;
@@ -55,14 +58,9 @@ export const SUBSCRIPTION_PLAN_POLICIES = {
 	free: {
 		id: "free",
 		name: "Sync Free",
-		pricing: {
-			monthlyUsd: 0,
-			annualMonthlyUsd: 0,
-			annualUsd: 0,
-		},
 		limits: {
 			syncedVaults: 1,
-			storageLimitBytes: 50 * BYTES_PER_MB,
+			storageLimitBytes: 30 * BYTES_PER_MB,
 			maxFileSizeBytes: 3 * BYTES_PER_MB,
 			versionHistoryRetentionDays: 1,
 		},
@@ -75,11 +73,6 @@ export const SUBSCRIPTION_PLAN_POLICIES = {
 		id: "starter",
 		name: "Sync Starter",
 		badge: "$1/month",
-		pricing: {
-			monthlyUsd: 1,
-			annualMonthlyUsd: 10 / 12,
-			annualUsd: 10,
-		},
 		limits: {
 			syncedVaults: 1,
 			storageLimitBytes: BYTES_PER_GB,
@@ -91,14 +84,20 @@ export const SUBSCRIPTION_PLAN_POLICIES = {
 			storageUpgrade: false,
 		},
 	},
+	plus: {
+		id: "plus",
+		name: "Sync Plus",
+		limits: {
+			syncedVaults: 3,
+			storageLimitBytes: 5 * BYTES_PER_GB,
+			maxFileSizeBytes: 100 * BYTES_PER_MB,
+			versionHistoryRetentionDays: 365,
+		},
+		features: { snapshots: true, storageUpgrade: false },
+	},
 	self_hosted: {
 		id: "self_hosted",
 		name: "Self Hosted",
-		pricing: {
-			monthlyUsd: 0,
-			annualMonthlyUsd: 0,
-			annualUsd: 0,
-		},
 		limits: {
 			syncedVaults: 0,
 			storageLimitBytes: 0,
@@ -125,8 +124,7 @@ export function applySubscriptionPlanLimitOverrides(
 	return {
 		...policy,
 		limits: {
-			syncedVaults:
-				overrides.syncedVaults ?? policy.limits.syncedVaults,
+			syncedVaults: overrides.syncedVaults ?? policy.limits.syncedVaults,
 			storageLimitBytes: policy.limits.storageLimitBytes,
 			maxFileSizeBytes: policy.limits.maxFileSizeBytes,
 			versionHistoryRetentionDays: policy.limits.versionHistoryRetentionDays,
@@ -148,13 +146,17 @@ export function subscriptionGrantsAccess(
 		return false;
 	}
 	if (ACTIVE_ACCESS_STATUSES.has(subscription.status)) {
-		return !subscription.periodEnd || subscription.periodEnd.getTime() > Date.now();
+		return (
+			!subscription.periodEnd || subscription.periodEnd.getTime() > Date.now()
+		);
 	}
 	if (!PERIOD_ACCESS_STATUSES.has(subscription.status)) {
 		return false;
 	}
 
-	return !!subscription.periodEnd && subscription.periodEnd.getTime() > Date.now();
+	return (
+		!!subscription.periodEnd && subscription.periodEnd.getTime() > Date.now()
+	);
 }
 
 export function subscriptionAccessPlanId(
@@ -180,7 +182,9 @@ export function subscriptionAccess(
 	}
 
 	const productIdsByPlanId = config.productIdsByPlanId ?? {};
-	for (const [planId, productIdsByInterval] of Object.entries(productIdsByPlanId)) {
+	for (const [planId, productIdsByInterval] of Object.entries(
+		productIdsByPlanId,
+	)) {
 		for (const [billingInterval, productId] of Object.entries(
 			productIdsByInterval ?? {},
 		)) {
@@ -194,4 +198,12 @@ export function subscriptionAccess(
 	}
 
 	return null;
+}
+
+/** Organization sharing entitlement; zero member limit means unrestricted. */
+export function organizationSharingPolicy(planId: SubscriptionPlanId) {
+	return {
+		enabled: planId === "plus" || planId === "self_hosted",
+		memberLimit: planId === "self_hosted" ? 0 : 3,
+	};
 }

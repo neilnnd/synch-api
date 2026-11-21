@@ -1,30 +1,29 @@
 import { asc, eq } from "drizzle-orm";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { betterAuth } from "better-auth";
-import { APIError } from "better-auth/api";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import type { BetterAuthPlugin } from "better-auth";
-import { bearer, deviceAuthorization, organization } from "better-auth/plugins";
+import {
+	bearer,
+	deviceAuthorization,
+	genericOAuth,
+	lastLoginMethod,
+	organization,
+} from "better-auth/plugins";
 
 import type { AppDb } from "../db/client";
 import * as schema from "../db/d1";
 import {
+	isAllowlistExemptSource,
 	isEmailAllowed,
 	parseAllowedEmails,
 	SIGN_UP_EMAIL_NOT_ALLOWED,
 } from "./policies/allowed-emails";
 import { defaultOrganizationSlug } from "./policies/organization";
+import type { OidcProviderConfig } from "./policies/oidc";
+import { recordOidcDiagnostic, shouldEmitOidcDiagnostic } from "./oidc-diagnostics";
 
-export type OutgoingEmail = {
-	from: string;
-	to: string;
-	subject: string;
-	text?: string;
-	html?: string;
-};
-
-export type EmailSender = {
-	send(message: OutgoingEmail): Promise<unknown>;
-};
+import type { EmailSender } from "../platform/email";
 
 export type AuthFeatureConfig = {
 	baseURL: string;
@@ -35,6 +34,17 @@ export type AuthFeatureConfig = {
 	email?: EmailSender;
 	emailFrom?: string;
 	allowedEmails?: string;
+	googleClientId?: string;
+	googleClientSecret?: string;
+	githubClientId?: string;
+	githubClientSecret?: string;
+	/** Registers the `generic-oauth` plugin against this provider when present. */
+	oidc?: OidcProviderConfig;
+	/**
+	 * Toggles the `emailAndPassword` provider. Left unset, email/password stays
+	 * enabled -- the historical default.
+	 */
+	emailAndPassword?: "enabled" | "disabled";
 };
 
 export type AuthPlugin = BetterAuthPlugin;
@@ -49,6 +59,10 @@ export function createBetterAuth(db: AppDb, config: BetterAuthConfig) {
 	const emailVerification = createEmailVerificationConfig(config);
 	const allowedEmails = parseAllowedEmails(config.allowedEmails);
 	const auth = betterAuth({
+		socialProviders: {
+			google: optionalOAuthProvider(config.baseURL, "google", config.googleClientId, config.googleClientSecret),
+			github: optionalOAuthProvider(config.baseURL, "github", config.githubClientId, config.githubClientSecret),
+		},
 		baseURL: config.baseURL,
 		secret: config.secret,
 		database: drizzleAdapter(db, {
@@ -57,22 +71,84 @@ export function createBetterAuth(db: AppDb, config: BetterAuthConfig) {
 		}),
 		trustedOrigins: config.trustedOrigins,
 		emailAndPassword: {
-			enabled: true,
+			enabled: config.emailAndPassword !== "disabled",
 			requireEmailVerification:
 				config.emailVerification === "required" && !config.devMode,
 		},
 		emailVerification,
+		account: {
+			accountLinking: {
+				// Community deployments disable email verification and restrict sign-up
+				// with an allowlist. Provider-verified email is still required to link.
+				requireLocalEmailVerified: config.emailVerification === "required",
+			},
+		},
+		user: {
+			validateUserInfo: async ({ user, source }) => {
+				// validateUserInfo is used here -- rather than the previous
+				// databaseHooks.user.create.before throw -- because it is the only
+				// hook that receives source.method and source.oauth.providerId,
+				// which isAllowlistExemptSource needs to recognize a sign-up the
+				// configured OIDC provider vouches for. The identity provider is the
+				// authority for identities it asserts, so a sign-up federated
+				// through the configured OIDC provider bypasses the email allowlist;
+				// every other creation path (password, and any future auth method
+				// Better Auth adds) stays gated.
+				// Check the current provider assertion on both signup and returning login.
+				if (source.method === "oauth" && user.emailVerified !== true) {
+					return {
+						error: "email_not_verified",
+						errorDescription: "Verify your email with your sign-in provider before signing in.",
+					};
+				}
+				if (source.action !== "create-user" || isAllowlistExemptSource(source)) {
+					return;
+				}
+				if (
+					allowedEmails &&
+					(typeof user.email !== "string" || !isEmailAllowed(user.email, allowedEmails))
+				) {
+					// The rejected email is attacker-supplied input (this hook runs
+					// before any credential is verified), so it must never reach the
+					// log -- only the stable rejection code and the method that was
+					// attempted, which is exactly enough for an operator to see that
+					// the allowlist is doing its job without exposing who tried it.
+					const key = `allowlist-rejection:${SIGN_UP_EMAIL_NOT_ALLOWED.code}:${source.method}`;
+					if (shouldEmitOidcDiagnostic(key)) {
+						recordOidcDiagnostic(key, {
+							code: SIGN_UP_EMAIL_NOT_ALLOWED.code,
+							method: source.method,
+						});
+					}
+					return {
+						error: SIGN_UP_EMAIL_NOT_ALLOWED.code,
+						errorDescription: SIGN_UP_EMAIL_NOT_ALLOWED.message,
+					};
+				}
+			},
+		},
 		session: {
 			expiresIn: SESSION_EXPIRES_IN_SECONDS,
+		},
+		hooks: {
+			before: createAuthMiddleware(async (ctx) => {
+				if (ctx.path !== "/sign-up/email") return;
+				const body: unknown = ctx.body;
+				if (!body || typeof body !== "object" || !("email" in body) || typeof body.email !== "string") return;
+				const existing = await ctx.context.internalAdapter.findUserByEmail(body.email.toLowerCase());
+				if (existing) {
+					// Return an explicit error even when email verification is required;
+					// Better Auth otherwise responds as if it sent a verification email.
+					throw APIError.from("UNPROCESSABLE_ENTITY", {
+						code: "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL",
+						message: "This email is already registered. Please sign in instead.",
+					});
+				}
+			}),
 		},
 		databaseHooks: {
 			user: {
 				create: {
-					before: async (user) => {
-						if (allowedEmails && !isEmailAllowed(user.email, allowedEmails)) {
-							throw APIError.from("FORBIDDEN", SIGN_UP_EMAIL_NOT_ALLOWED);
-						}
-					},
 					after: async (user) => {
 						if (await readDefaultOrganizationIdForUser(db, user.id)) {
 							return;
@@ -130,6 +206,24 @@ export function createBetterAuth(db: AppDb, config: BetterAuthConfig) {
 		},
 		plugins: [
 			organization({ organizationLimit: 1 }),
+			lastLoginMethod({
+				// Managed email sign-up creates a session only after verification.
+				customResolveMethod: (ctx) => ctx.path === "/verify-email" ? "email" : null,
+			}),
+			...(config.oidc
+				? [genericOAuth({
+					config: [{
+						providerId: config.oidc.providerId,
+						clientId: config.oidc.clientId,
+						clientSecret: config.oidc.clientSecret,
+						discoveryUrl: config.oidc.discoveryUrl,
+						scopes: config.oidc.scopes,
+						pkce: true,
+						requireIdTokenVerification: true,
+						accountIssuer: config.oidc.accountIssuer,
+					}],
+				})]
+				: []),
 			...(config.plugins ?? []),
 			bearer(),
 			deviceAuthorization({
@@ -238,4 +332,15 @@ function escapeHtml(value: string): string {
 
 function getDeviceVerificationUri(baseURL: string): string {
 	return new URL("/device", baseURL).toString();
+}
+
+function optionalOAuthProvider(baseURL: string, provider: "google" | "github", id?: string, secret?: string) {
+	const clientId = id?.trim();
+	const clientSecret = secret?.trim();
+	return clientId && clientSecret ? {
+		clientId,
+		clientSecret,
+		// Used for both the authorization request and the token exchange.
+		redirectURI: new URL(`/v1/auth/callback/${provider}`, baseURL).toString(),
+	} : undefined;
 }

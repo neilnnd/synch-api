@@ -163,6 +163,7 @@ export type EntryStatesListedMessage = {
 		entryId: string;
 		revision: number;
 		blobId: string | null;
+		blobSize: number | null;
 		encryptedMetadata: string;
 		deleted: boolean;
 		updatedSeq: number;
@@ -334,6 +335,7 @@ export type ServerControlMessage =
 	| PresenceAvailabilityMessage;
 
 export type SocketSession = {
+	accessVersion?: number;
 	userId: string;
 	localVaultId: string;
 	vaultId: string;

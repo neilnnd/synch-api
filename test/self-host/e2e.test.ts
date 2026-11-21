@@ -1,20 +1,30 @@
+import { createPasswordWrappedRemoteVaultKey, unwrapRemoteVaultKeyWithPassword } from "../../../../packages/vault-crypto/src/crypto";
+import { SharingClient } from "../../../../packages/sync-client/src/sharing/client";
+import { SharingManager, type StoredKeyReceiver } from "../../../../packages/sync-client/src/sharing/manager";
+import type { HttpClient } from "../../../../packages/sync-client/src/http/request";
 import { serve, type ServerType } from "@hono/node-server";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
+import Database from "better-sqlite3";
 
-import { createNodeRuntime, type NodeRuntime } from "../../src/runtime/node";
+import { parseOidcProviderConfig, type OidcProviderConfig } from "../../src/auth/policies/oidc";
+import { OIDC_RETRY_COOLDOWN_MS } from "../../src/auth/oidc-auth";
+import { createNodeRuntime } from "../../src/runtime/node";
 import { createNodeWebSocketUpgradeHandler } from "../../src/runtime/node-websocket";
 import { LocalDiskBlobObjectStorage } from "../../src/sync-blob-transfer/adapters/outbound/local-disk-object-storage";
 import {
 	SYNC_WEBSOCKET_AUTH_PROTOCOL_PREFIX,
 	SYNC_WEBSOCKET_PROTOCOL,
 } from "../../src/sync-access/application";
+import { createFakeIdp } from "../helpers/fake-idp";
+import { startFakeIdpServer } from "./fake-idp-server";
 
 const API_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const TSX_BIN = path.join(API_ROOT, "node_modules/.bin/tsx");
@@ -79,7 +89,7 @@ async function reserveFreePort(): Promise<number> {
 }
 
 /** Boots a full self-hosted Node runtime (libSQL app DB + SQLite coordinator + local disk blobs) against an ephemeral port. */
-async function bootServer(existingDataDir?: string) {
+async function bootServer(existingDataDir?: string, oidc?: OidcProviderConfig) {
 	const dataDir = existingDataDir ?? mkdtempSync(path.join(tmpdir(), "synch-self-host-e2e-"));
 	const port = await reserveFreePort();
 	const baseUrl = `http://127.0.0.1:${port}`;
@@ -87,9 +97,10 @@ async function bootServer(existingDataDir?: string) {
 		dataDir,
 		publicUrl: baseUrl,
 		betterAuthSecret: "test-secret-test-secret-test-secret",
-		authAllowedEmails: SELF_HOST_ALLOWED_EMAIL,
+		authAllowedEmails: `${SELF_HOST_ALLOWED_EMAIL},member@test.invalid`,
 		syncTokenSecret: "test-sync-token-secret-test-sync",
 		blobStorage: new LocalDiskBlobObjectStorage(path.join(dataDir, "blobs")),
+		oidc,
 	});
 	const { wss, handleUpgrade } = createNodeWebSocketUpgradeHandler(runtime, baseUrl);
 	const server = serve({ fetch: (request) => runtime.fetch(request), port });
@@ -129,7 +140,7 @@ async function waitForHealth(baseUrl: string, deadline = Date.now() + 10_000): P
  * uncheckpointed `-wal` file behind, which is the actual crash-recovery path
  * `locking_mode = EXCLUSIVE` + WAL replay needs to be exercised against.
  */
-async function bootSubprocessServer(dataDir: string): Promise<{ baseUrl: string; child: ChildProcess }> {
+async function bootSubprocessServer(dataDir: string, extraEnv: Record<string, string> = {}): Promise<{ baseUrl: string; child: ChildProcess }> {
 	const port = await reserveFreePort();
 	const baseUrl = `http://127.0.0.1:${port}`;
 	// `detached: true` makes this child the leader of its own process group.
@@ -148,6 +159,7 @@ async function bootSubprocessServer(dataDir: string): Promise<{ baseUrl: string;
 			BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
 			AUTH_ALLOWED_EMAILS: SELF_HOST_ALLOWED_EMAIL,
 			SYNC_TOKEN_SECRET: "test-sync-token-secret-test-sync",
+			...extraEnv,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 		detached: true,
@@ -185,6 +197,35 @@ function killAndWaitForExit(child: ChildProcess): Promise<void> {
 		}
 		child.kill("SIGKILL");
 	});
+}
+
+const OIDC_CLIENT_SECRET = "test-oidc-client-secret";
+
+function setCookieHeader(response: Response): string {
+	return response.headers
+		.getSetCookie()
+		.map((pair) => pair.split(";")[0] ?? "")
+		.filter(Boolean)
+		.join("; ");
+}
+
+async function startOidcSignIn(baseUrl: string): Promise<{ url: URL; cookie: string }> {
+	const response = await fetch(`${baseUrl}/api/auth/sign-in/social`, {
+		method: "POST",
+		headers: { "content-type": "application/json", origin: baseUrl },
+		body: JSON.stringify({
+			provider: "oidc",
+			callbackURL: `${baseUrl}/dashboard`,
+			errorCallbackURL: `${baseUrl}/sign-in-error`,
+		}),
+	});
+	const body = (await response.json()) as { url?: string };
+	if (!body.url) {
+		throw new Error(
+			`sign-in/social did not return an authorization url (status ${response.status})`,
+		);
+	}
+	return { url: new URL(body.url), cookie: setCookieHeader(response) };
 }
 
 async function signUpAndCreateVault(baseUrl: string) {
@@ -284,6 +325,227 @@ describe("self-hosted Node runtime: end-to-end sync", () => {
 		cleanup = [];
 	});
 
+	it("applies configured history retention to existing vaults after process restarts", async () => {
+		const dataDir = mkdtempSync(path.join(tmpdir(), "synch-retention-"));
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		let owner: Awaited<ReturnType<typeof signUpAndCreateVault>> | undefined;
+		const previousExpiries = new Map<string, number>();
+		// Exercise the real env parser and entrypoint, including returning to the default.
+		for (const days of [1, 90, 30, 1]) {
+			const phase = previousExpiries.size;
+			const running = await bootSubprocessServer(dataDir, days === 1 ? {} : {
+				VERSION_HISTORY_RETENTION_DAYS: String(days),
+			});
+			cleanup.push(() => killAndWaitForExit(running.child));
+			owner ??= await signUpAndCreateVault(running.baseUrl);
+			const token = await issueSyncToken(running.baseUrl, owner.sessionCookie, owner.vaultId, "retention-device");
+			const ws = await connectSocket(running.baseUrl, owner.vaultId, token);
+			cleanup.push(() => ws.terminate());
+			ws.send(JSON.stringify({ type: "hello", requestId: "hello", lastKnownCursor: 0 }));
+			await nextMessage(ws, message => message.type === "hello_ack");
+			for (let revision = 0; revision < 2; revision++) {
+				const blobId = `blob-${phase}-${revision}`;
+				await uploadBlob(running.baseUrl, token, owner.vaultId, blobId, "encrypted content");
+				ws.send(JSON.stringify({
+					type: "commit_mutations", requestId: `commit-${phase}-${revision}`,
+					mutations: [{ mutationId: `m-${phase}-${revision}`, entryId: `entry-${phase}`,
+						op: "upsert", baseRevision: revision, blobId, encryptedMetadata: `encrypted-${revision}` }],
+				}));
+				await nextMessage(ws, message => message.type === "commit_mutations_committed");
+			}
+			ws.terminate();
+			await killAndWaitForExit(running.child);
+			const db = new Database(path.join(dataDir, "vaults", `${owner.vaultId}.sqlite`));
+			try {
+				expect(db.prepare("SELECT version_history_retention_days AS days FROM coordinator_state").get()).toEqual({ days });
+				const rows = db.prepare("SELECT version_id, entry_id, captured_at, expires_at FROM entry_versions").all() as {
+					version_id: string; entry_id: string; captured_at: number; expires_at: number;
+				}[];
+				const fresh = rows.filter(row => row.entry_id === `entry-${phase}`);
+				expect(fresh.length).toBeGreaterThan(0);
+				for (const row of fresh) expect(row.expires_at - row.captured_at).toBe(days * 86_400_000);
+				for (const [id, expiry] of previousExpiries) {
+					expect(rows.find(row => row.version_id === id)?.expires_at).toBe(expiry);
+				}
+				for (const row of fresh) previousExpiries.set(row.version_id, row.expires_at);
+			} finally {
+				db.close();
+			}
+		}
+	}, 30_000);
+
+    it("shares retained history through personal passwords, recovers with approval, and closes revoked sockets", async () => {
+      const { baseUrl, dataDir, runtime, server, wss } = await bootServer();
+      cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+      cleanup.push(() => runtime.dispose());
+      cleanup.push(() => closeServer(server, wss));
+      const owner = await signUpAndCreateVault(baseUrl);
+      const signed = await fetch(`${baseUrl}/api/auth/sign-up/email`, { method: "POST", headers: { "content-type": "application/json", origin: baseUrl }, body: JSON.stringify({ email: "member@test.invalid", password: "another correct horse battery", name: "Member" }) });
+      expect(signed.status).toBe(200);
+      const memberCookie = signed.headers.get("set-cookie")!.split(";")[0];
+      const signup = await signed.json() as { user: { id: string } };
+      const userId = signup.user.id;
+      const request = async (cookie: string, path: string, method = "GET", body?: unknown) => {
+        const response = await fetch(`${baseUrl}${path}`, { method, headers: { cookie, origin: baseUrl, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+        return { response, json: await response.json() as Record<string, any> };
+      };
+      const ownerIdentity = await request(owner.sessionCookie, "/api/auth/get-session");
+      const organizationId = (await request(owner.sessionCookie, "/v1/organizations")).json.organizations[0].id as string;
+      const wrapped = await createPasswordWrappedRemoteVaultKey("owner keeps a private passphrase");
+      const created = await request(owner.sessionCookie, "/v1/vaults", "POST", { name: "Shared history", organizationId, initialWrapper: { kind: "password", envelope: wrapped.envelope } });
+      expect(created.response.status).toBe(201);
+      const vaultId = created.json.vault.id as string;
+      const ownerToken = await issueSyncToken(baseUrl, owner.sessionCookie, vaultId, "owner-device");
+      const ownerSocket = await connectSocket(baseUrl, vaultId, ownerToken); cleanup.push(() => ownerSocket.terminate());
+      ownerSocket.send(JSON.stringify({ type: "hello", requestId: "hello-owner", lastKnownCursor: 0 })); await nextMessage(ownerSocket, message => message.type === "hello_ack");
+      for (let revision = 0; revision < 2; revision++) {
+        await uploadBlob(baseUrl, ownerToken, vaultId, `history-${revision}`, `encrypted historical content ${revision}`);
+        ownerSocket.send(JSON.stringify({ type: "commit_mutations", requestId: `commit-${revision}`, mutations: [{ mutationId: `mutation-${revision}`, entryId: "shared-file", op: "upsert", baseRevision: revision, blobId: `history-${revision}`, encryptedMetadata: `metadata-${revision}` }] }));
+        await nextMessage(ownerSocket, message => message.type === "commit_mutations_committed");
+      }
+      const invite = await request(owner.sessionCookie, `/v1/organizations/${organizationId}/invitations`, "POST", { email: "member@test.invalid", role: "member" });
+      expect(invite.response.status).toBe(201);
+      expect((await request(memberCookie, `/v1/invitations/${invite.json.id}/accept`, "POST")).response.status).toBe(200);
+      expect((await request(memberCookie, `/v1/vaults/${vaultId}/bootstrap`)).response.status).toBe(403);
+      expect((await request(memberCookie, `/v1/vaults/${owner.vaultId}/bootstrap`)).response.status).toBe(403);
+      let loseCompleteResponse = true;
+      const http = (cookie: string): HttpClient => ({ request: async input => {
+        const headers = new Headers(input.headers); headers.delete("authorization"); headers.set("cookie", cookie); headers.set("origin", baseUrl);
+        const response = await fetch(input.url, { method: input.method, headers, body: input.body });
+        const json = await response.json();
+        if (cookie === memberCookie && input.url.endsWith("/complete") && loseCompleteResponse && response.ok) { loseCompleteResponse = false; throw new Error("response lost"); }
+        return { status: response.status, json };
+      } });
+      const secrets = new Map<string, StoredKeyReceiver>();
+      const secretStore = { read: async (scope: string) => secrets.get(scope) ?? null, write: async (scope: string, value: StoredKeyReceiver | null) => { if (value) secrets.set(scope, value); else secrets.delete(scope); } };
+      const memberClient = new SharingClient(http(memberCookie), baseUrl, "cookie-auth");
+      let receiver = new SharingManager(memberClient, userId, secretStore);
+      const sender = new SharingManager(new SharingClient(http(owner.sessionCookie), baseUrl, "cookie-auth"), ownerIdentity.json.user.id, secretStore);
+      const pending = await receiver.begin(vaultId);
+      await expect(sender.approve(pending, wrapped.remoteVaultKey, "wrong-code")).rejects.toThrow("verification code");
+      await sender.approve(pending, wrapped.remoteVaultKey, await receiver.verificationCode(pending));
+      const password = "member has a separate passphrase";
+      await expect(receiver.receive(vaultId, password, password)).rejects.toThrow("response lost");
+      // Recreate the manager to model a device restart after an ambiguous response.
+      receiver = new SharingManager(memberClient, userId, secretStore);
+      await receiver.receive(vaultId, password, password);
+      expect(secrets.size).toBe(0);
+      const bootstrap = (await request(memberCookie, `/v1/vaults/${vaultId}/bootstrap`)).json;
+      expect(bootstrap.wrappers).toHaveLength(1); expect(bootstrap.wrappers[0].userId).toBe(userId);
+      expect(await unwrapRemoteVaultKeyWithPassword(password, bootstrap.wrappers[0].envelope, { vaultId, userId })).toEqual(wrapped.remoteVaultKey);
+      const recovery = await receiver.begin(vaultId); expect(recovery.purpose).toBe("recovery");
+      await sender.approve(recovery, wrapped.remoteVaultKey, await receiver.verificationCode(recovery));
+      const recoveredPassword = "a freshly recovered personal phrase";
+      await receiver.receive(vaultId, recoveredPassword, recoveredPassword);
+      await receiver.changePassword(vaultId, wrapped.remoteVaultKey, "another personally chosen phrase", "another personally chosen phrase");
+      const ownerBootstrap = (await request(owner.sessionCookie, `/v1/vaults/${vaultId}/bootstrap`)).json;
+      expect(ownerBootstrap.wrappers[0].envelope).toEqual(wrapped.envelope);
+      const token = await issueSyncToken(baseUrl, memberCookie, vaultId, "member-device");
+      const memberSocket = await connectSocket(baseUrl, vaultId, token); cleanup.push(() => memberSocket.terminate());
+      memberSocket.send(JSON.stringify({ type: "hello", requestId: "hello-member", lastKnownCursor: 0 })); await nextMessage(memberSocket, message => message.type === "hello_ack");
+      memberSocket.send(JSON.stringify({ type: "list_entry_versions", requestId: "history", entryId: "shared-file", before: null, limit: 10 }));
+      const history = await nextMessage(memberSocket, message => message.type === "entry_versions_listed");
+      expect(history).toMatchObject({ versions: expect.arrayContaining([expect.objectContaining({ blobId: "history-1" })]) });
+      const closed = new Promise<number>(resolve => memberSocket.once("close", code => resolve(code)));
+      expect((await request(owner.sessionCookie, `/v1/organizations/${organizationId}/members/${userId}`, "DELETE")).response.status).toBe(200);
+      expect(await closed).toBe(1012);
+      const deniedBlob = await fetch(`${baseUrl}/v1/vaults/${vaultId}/blobs/history-1`, { headers: { authorization: `Bearer ${token}` } });
+      expect(deniedBlob.status).toBe(403);
+      expect((await request(memberCookie, "/v1/sync/token", "POST", { vaultId, localVaultId: "member-device" })).response.status).toBe(403);
+      expect((await request(memberCookie, `/v1/invitations/${invite.json.id}/accept`, "POST")).response.status).toBe(200);
+      expect((await request(memberCookie, `/v1/vaults/${vaultId}/bootstrap`)).response.status).toBe(403);
+      for (const page of ["organizations", "invitations"]) expect((await fetch(`${baseUrl}/${page}`)).status).toBe(200);
+    }, 20000);
+
+	it("cleans orphaned upload parts before serving after a process crash", async () => {
+		const dataDir = mkdtempSync(path.join(tmpdir(), "synch-orphan-upload-"));
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		const first = await bootSubprocessServer(dataDir);
+		cleanup.push(() => killAndWaitForExit(first.child));
+		const blobDir = path.join(dataDir, "blobs");
+		mkdirSync(path.join(blobDir, "vault"), { recursive: true });
+		writeFileSync(path.join(blobDir, "vault", "complete"), "good");
+		writeFileSync(path.join(blobDir, ".uploads", "interrupted.part"), "partial");
+		await killAndWaitForExit(first.child);
+		const second = await bootSubprocessServer(dataDir);
+		cleanup.push(() => killAndWaitForExit(second.child));
+		expect(readdirSync(path.join(blobDir, ".uploads")).filter(name => name.endsWith(".part"))).toEqual([]);
+		expect(readFileSync(path.join(blobDir, "vault", "complete"), "utf8")).toBe("good");
+	});
+
+	it.each(["timeout", "disconnect"] as const)("survives five concurrent upload failures (%s), then retries after restart", async (mode) => {
+		const dataDir = mkdtempSync(path.join(tmpdir(), "synch-interrupted-upload-"));
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		const first = await bootSubprocessServer(dataDir, { REQUEST_TIMEOUT_MS: "2000", SYNC_TOKEN_TTL_SECONDS: "2" });
+		cleanup.push(() => killAndWaitForExit(first.child));
+		const { sessionCookie, vaultId } = await signUpAndCreateVault(first.baseUrl);
+		const token = await issueSyncToken(first.baseUrl, sessionCookie, vaultId, "device-a");
+		const device = await connectSocket(first.baseUrl, vaultId, token);
+		cleanup.push(() => device.close());
+		device.send(JSON.stringify({ type: "hello", requestId: "hello", lastKnownCursor: 0 }));
+		await nextMessage(device, (m) => m.type === "hello_ack");
+		// Internal compensation and administrator repair stay private in self-hosting.
+		expect((await fetch(`${first.baseUrl}/internal/v1/vaults/${vaultId}/blobs/interrupted-0/stage`, { method: "DELETE" })).status).toBe(404);
+		expect((await fetch(`${first.baseUrl}/admin/v1/vaults/${vaultId}/sync-repair`, { method: "POST" })).status).toBe(404);
+		const sizes = [6, 10, 11, 11, 16].map((mb) => mb * 1024 * 1024);
+		const responses = await Promise.all(sizes.map((size, i) => new Promise<number | null>((resolve, reject) => {
+			const req = httpRequest(`${first.baseUrl}/v1/vaults/${vaultId}/blobs/interrupted-${i}`, {
+				method: "PUT", headers: { authorization: `Bearer ${token}`, "content-length": size, "x-blob-size": size },
+			}, (res) => {
+				res.resume();
+				res.on("end", () => resolve(res.statusCode!));
+			});
+			const timer = setInterval(() => req.write(Buffer.alloc(1024)), 50);
+			const disconnectTimer = mode === "disconnect" ? setTimeout(() => req.destroy(), 200) : undefined;
+			req.on("error", (error: NodeJS.ErrnoException) => {
+				if (mode === "disconnect") resolve(null);
+				else if (error.code !== "ECONNRESET") reject(error);
+			});
+			req.on("close", () => { clearInterval(timer); clearTimeout(disconnectTimer); });
+		})));
+		expect(responses).toEqual(sizes.map(() => mode === "timeout" ? 408 : null));
+		await waitForHealth(first.baseUrl);
+		expect(first.child.exitCode).toBeNull();
+		// The failed attempts must remove incomplete files before restart.
+		await expect.poll(() => listPublicFiles(path.join(dataDir, "blobs"))).toEqual([]);
+		await expect.poll(() => readdirSync(path.join(dataDir, "blobs", ".uploads"))).toEqual([]);
+		// Failed uploads retain their quota reservation until staged-blob GC.
+		const observerToken = await issueSyncToken(first.baseUrl, sessionCookie, vaultId, "observer");
+		const observer = await connectSocket(first.baseUrl, vaultId, observerToken);
+		cleanup.push(() => observer.close());
+		observer.send(JSON.stringify({ type: "hello", requestId: "observer-hello", lastKnownCursor: 0 }));
+		expect(await nextMessage(observer, (m) => m.type === "hello_ack"))
+			.toMatchObject({ storageStatus: { storageUsedBytes: sizes.reduce((sum, size) => sum + size, 0) } });
+		await killAndWaitForExit(first.child);
+		const second = await bootSubprocessServer(dataDir);
+		cleanup.push(() => killAndWaitForExit(second.child));
+		const retryToken = await issueSyncToken(second.baseUrl, sessionCookie, vaultId, "device-a");
+		// Retry the same blob IDs with complete bodies, in parallel, at a bounded rate.
+		await Promise.all(sizes.map(async (size, i) => {
+			const payload = Buffer.alloc(size, i + 1);
+			const url = `${second.baseUrl}/v1/vaults/${vaultId}/blobs/interrupted-${i}`;
+			await new Promise<void>((resolve, reject) => {
+				const req = httpRequest(url, { method: "PUT", headers: { authorization: `Bearer ${retryToken}`, "x-blob-size": size, "content-length": size } }, res => {
+					res.resume();
+					res.on("end", () => res.statusCode === 201 ? resolve() : reject(new Error(`upload status ${res.statusCode}`)));
+				});
+				let offset = 0;
+				const timer = setInterval(() => {
+					if (req.writableNeedDrain) return;
+					const end = Math.min(offset + 256 * 1024, size);
+					req.write(payload.subarray(offset, end));
+					offset = end;
+					if (offset === size) { clearInterval(timer); req.end(); }
+				}, 10);
+				req.on("error", reject);
+				req.on("close", () => clearInterval(timer));
+			});
+			const downloaded = await fetch(url, { headers: { authorization: `Bearer ${retryToken}` } });
+			expect(downloaded.status).toBe(200);
+			expect(Buffer.from(await downloaded.arrayBuffer()).equals(payload)).toBe(true);
+		}));
+	}, 40_000);
+
 	it("serves the auth pages Cloudflare would otherwise serve via its assets binding", async () => {
 		// On Cloudflare, wrangler.jsonc's "assets" binding serves apps/api/public/*
 		// ahead of the Worker - the device-authorization flow's verification URI
@@ -297,7 +559,7 @@ describe("self-hosted Node runtime: end-to-end sync", () => {
 		cleanup.push(() => closeServer(server, wss));
 
 		const publicFiles = listPublicFiles(path.join(API_ROOT, "public"));
-		expect(publicFiles).toEqual(expect.arrayContaining(["styles.css", "favicon.ico"]));
+		expect(publicFiles).toEqual(expect.arrayContaining(["favicon.ico"]));
 
 		for (const file of publicFiles) {
 			const urlPath = `/${file}`;
@@ -317,7 +579,7 @@ describe("self-hosted Node runtime: end-to-end sync", () => {
 			}
 		}
 
-		for (const page of ["/device", "/signin", "/signup", "/vaults"]) {
+		for (const page of ["/device", "/signin", "/signup", "/vaults", "/organizations", "/invitations"]) {
 			const response = await fetch(`${baseUrl}${page}`);
 			expect(response.status, page).toBe(200);
 			expect(response.headers.get("content-type"), page).toMatch(/^text\/html/);
@@ -540,4 +802,224 @@ describe("self-hosted Node runtime: end-to-end sync", () => {
 		},
 		30_000,
 	);
+
+	it("completes an OIDC sign-in against the self-hosted Node runtime using a real fake-IdP HTTP server", async () => {
+		// Unlike the Workers-pool version of this test (test/integration/auth/oidc.test.ts),
+		// nothing here patches globalThis.fetch: the fake IdP is a real,
+		// locally-listening node:http server, and the Node runtime's own
+		// outbound calls to its token and JWKS endpoints go over a real socket -
+		// proving the OIDC round trip on the one runtime the Workers integration
+		// suite never exercises.
+		const idpPort = await reserveFreePort();
+		const idp = await createFakeIdp(`http://127.0.0.1:${idpPort}`);
+		const idpServer = await startFakeIdpServer(idp);
+		cleanup.push(() => idpServer.close());
+
+		const oidc = parseOidcProviderConfig({
+			discoveryUrl: idp.discoveryUrl,
+			clientId: idp.clientId,
+			clientSecret: OIDC_CLIENT_SECRET,
+		});
+		if (!oidc) {
+			throw new Error("expected a fully-configured OIDC provider for this test");
+		}
+
+		const { dataDir, runtime, server, wss, baseUrl } = await bootServer(undefined, oidc);
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		cleanup.push(() => runtime.dispose());
+		cleanup.push(() => closeServer(server, wss));
+
+		const assertedEmail = `${uniqueId("oidc-node-e2e")}@idp.example`;
+		const authorize = await startOidcSignIn(baseUrl);
+		const nonce = authorize.url.searchParams.get("nonce") ?? "";
+		idp.tokenHandler = async () => ({
+			status: 200,
+			body: idp.tokenResponse(
+				await idp.signIdToken({ nonce, sub: uniqueId("oidc-node-sub"), email: assertedEmail }),
+			),
+		});
+
+		const state = authorize.url.searchParams.get("state") ?? "";
+		const callback = await fetch(
+			`${baseUrl}/api/auth/callback/oidc?code=fake-authorization-code&state=${encodeURIComponent(state)}`,
+			{
+				redirect: "manual",
+				headers: { cookie: authorize.cookie, origin: baseUrl },
+			},
+		);
+		expect(callback.status).toBe(302);
+
+		const session = await fetch(`${baseUrl}/api/auth/get-session`, {
+			headers: { cookie: setCookieHeader(callback), origin: baseUrl },
+		});
+		expect(session.status).toBe(200);
+		const sessionJson = (await session.json()) as { user?: { email?: string } } | null;
+		// Same assertion as the Workers-pool session test: the email IS the
+		// identity contract, and this is what proves the round trip actually
+		// created a session rather than merely returning a 302.
+		expect(sessionJson?.user?.email).toBe(assertedEmail);
+	});
+
+	it("isolates password sign-in from an unreachable OIDC provider and recovers OIDC once it comes back, with no process restart", async () => {
+		// Reserving a port without starting an IdP models a startup race.
+		// Discovery starts only when the first OIDC request arrives.
+		const idpPort = await reserveFreePort();
+		const idp = await createFakeIdp(`http://127.0.0.1:${idpPort}`);
+
+		const oidc = parseOidcProviderConfig({
+			discoveryUrl: idp.discoveryUrl,
+			clientId: idp.clientId,
+			clientSecret: OIDC_CLIENT_SECRET,
+		});
+		if (!oidc) {
+			throw new Error("expected a fully-configured OIDC provider for this test");
+		}
+
+		const { dataDir, runtime, server, wss, baseUrl } = await bootServer(undefined, oidc);
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		cleanup.push(() => runtime.dispose());
+		cleanup.push(() => closeServer(server, wss));
+
+		const signUpBody = JSON.stringify({
+			email: SELF_HOST_ALLOWED_EMAIL,
+			password: "correct horse battery staple",
+			name: "Isolation",
+		});
+
+		// Password sign-up has nothing to do with OIDC. An unrelated
+		// provider's discovery failure must not take it down too -- this
+		// request must finish without starting OIDC discovery at all.
+		const signUpWhileUnreachable = await fetch(`${baseUrl}/api/auth/sign-up/email`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: baseUrl },
+			body: signUpBody,
+		});
+		expect(signUpWhileUnreachable.status, await signUpWhileUnreachable.text()).toBeLessThan(300);
+
+		// Provider configuration stays advertised so browser users can retry.
+		const providersWhileUnreachable = await fetch(`${baseUrl}/v1/auth/providers`);
+		await expect(providersWhileUnreachable.json()).resolves.toMatchObject({ oidc: { providerId: "oidc" } });
+
+		const oidcSignInWhileUnreachable = await fetch(`${baseUrl}/api/auth/sign-in/social`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: baseUrl },
+			body: JSON.stringify({ provider: "oidc", callbackURL: `${baseUrl}/dashboard` }),
+		});
+		expect(oidcSignInWhileUnreachable.status).toBe(503);
+
+		// Bring the provider up: same process, same runtime, no restart.
+		const idpServer = await startFakeIdpServer(idp);
+		cleanup.push(() => idpServer.close());
+
+		// The rebuild cooldown means a request landing immediately after the
+		// provider comes back can still be served the stale "unavailable"
+		// state -- recovery is bounded by the cooldown window, not instant.
+		// Waiting it out here is what makes the assertions below about actual
+		// recovery, rather than about how quickly it happens.
+		await new Promise((resolve) => setTimeout(resolve, OIDC_RETRY_COOLDOWN_MS + 250));
+
+		// Once the cooldown has elapsed, the next request must retry discovery
+		// instead of replaying a permanently cached failure -- a full
+		// authorize/callback/get-session round trip, same as the "completes an
+		// OIDC sign-in" case above, proves OIDC sign-in itself works again, not
+		// just that some flag flipped.
+		const assertedEmail = `${uniqueId("oidc-recovery")}@idp.example`;
+		const authorize = await startOidcSignIn(baseUrl);
+		const nonce = authorize.url.searchParams.get("nonce") ?? "";
+		idp.tokenHandler = async () => ({
+			status: 200,
+			body: idp.tokenResponse(
+				await idp.signIdToken({ nonce, sub: uniqueId("oidc-recovery-sub"), email: assertedEmail }),
+			),
+		});
+
+		const state = authorize.url.searchParams.get("state") ?? "";
+		const callback = await fetch(
+			`${baseUrl}/api/auth/callback/oidc?code=fake-authorization-code&state=${encodeURIComponent(state)}`,
+			{
+				redirect: "manual",
+				headers: { cookie: authorize.cookie, origin: baseUrl },
+			},
+		);
+		expect(callback.status).toBe(302);
+
+		const session = await fetch(`${baseUrl}/api/auth/get-session`, {
+			headers: { cookie: setCookieHeader(callback), origin: baseUrl },
+		});
+		expect(session.status).toBe(200);
+		const sessionJson = (await session.json()) as { user?: { email?: string } } | null;
+		expect(sessionJson?.user?.email).toBe(assertedEmail);
+
+		// The recovery is now also visible in what the sign-in page would show.
+		const providersAfterRecovery = await fetch(`${baseUrl}/v1/auth/providers`);
+		await expect(providersAfterRecovery.json()).resolves.toMatchObject({
+			oidc: { providerId: "oidc" },
+		});
+	});
+
+	it("exits non-zero at boot when the OIDC config is partial", async () => {
+		const dataDir = mkdtempSync(path.join(tmpdir(), "synch-self-host-e2e-oidc-partial-"));
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		const port = await reserveFreePort();
+		const baseUrl = `http://127.0.0.1:${port}`;
+
+		const env = { ...process.env };
+		delete env.OIDC_DISCOVERY_URL;
+		delete env.OIDC_CLIENT_ID;
+		delete env.OIDC_CLIENT_SECRET;
+
+		const child = spawn(TSX_BIN, ["src/self-host.ts"], {
+			cwd: API_ROOT,
+			env: {
+				...env,
+				DATA_DIR: dataDir,
+				PORT: String(port),
+				PUBLIC_URL: baseUrl,
+				BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
+				AUTH_ALLOWED_EMAILS: SELF_HOST_ALLOWED_EMAIL,
+				SYNC_TOKEN_SECRET: "test-sync-token-secret-test-sync",
+				// Exactly one of the three OIDC_* variables that gate
+				// parseOidcProviderConfig - the other two below are the ones the
+				// boot failure must name.
+				OIDC_CLIENT_ID: "partial-oidc-client-id",
+			},
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let stderr = "";
+		child.stderr?.on("data", (chunk: Buffer) => {
+			stderr += chunk.toString("utf8");
+		});
+		cleanup.push(
+			() =>
+				new Promise<void>((resolve) => {
+					if (child.exitCode !== null || child.signalCode !== null) {
+						resolve();
+						return;
+					}
+					child.once("exit", () => resolve());
+					child.kill("SIGKILL");
+				}),
+		);
+
+		const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+			(resolve, reject) => {
+				const timeout = setTimeout(
+					() => reject(new Error(`self-host process did not exit within 10s (stderr: ${stderr})`)),
+					10_000,
+				);
+				child.once("exit", (code, signal) => {
+					clearTimeout(timeout);
+					resolve({ code, signal });
+				});
+			},
+		);
+
+		// The Node runtime is the one place fail-loudly is achievable at boot -
+		// unlike Cloudflare, which has no boot step and only surfaces this as a
+		// request-time error. `MissingOidcVariablesError`'s message names every
+		// missing variable, and that is what console.error prints to stderr here.
+		expect(exit.code).not.toBe(0);
+		expect(stderr).toContain("OIDC_DISCOVERY_URL");
+		expect(stderr).toContain("OIDC_CLIENT_SECRET");
+	});
 });

@@ -1,3 +1,4 @@
+import { createSharingFeature } from "./features/create-sharing-feature";
 import { createApp } from "../app";
 import type { AuthFeatureConfig } from "../auth/better-auth";
 import type { BillingApplicationConfig } from "../billing/application";
@@ -19,7 +20,10 @@ import {
 	type CoordinatorNamespace,
 } from "../sync-coordinator/adapters/outbound/durable-object-rpc/coordinator-proxy-repository";
 import type { BlobObjectStorage } from "../sync-blob-transfer/application/ports/outbound/blob-object-storage";
-import { blobObjectKey, blobObjectKeyPrefix } from "../platform/blob/object-key";
+import {
+	blobObjectKey,
+	blobObjectKeyPrefix,
+} from "../platform/blob/object-key";
 import type { VaultPurgeMessage } from "../vault/application";
 
 export type ApiApplicationDependencies = {
@@ -31,6 +35,7 @@ export type ApiApplicationDependencies = {
 
 export type ApiApplicationConfig = {
 	profile: DeploymentProfile;
+	selfHostedVersionHistoryRetentionDays?: number;
 	corsOrigin: string;
 	auth: Omit<AuthFeatureConfig, "emailVerification">;
 	syncTokenSecret: string;
@@ -56,6 +61,7 @@ export function createApiApplication(
 	const subscriptionFeature = createSubscriptionFeature(deps.db, {
 		selfHosted: isCommunityEdition(config.profile),
 		productIdsByPlanId: config.productIdsByPlanId,
+		selfHostedVersionHistoryRetentionDays: config.selfHostedVersionHistoryRetentionDays,
 	});
 	const vaultFeature = createVaultFeature({
 		db: deps.db,
@@ -72,12 +78,32 @@ export function createApiApplication(
 		productIdsByPlanId: config.productIdsByPlanId,
 		subscriptionAccessReader: subscriptionFeature.accessReader,
 	});
-	const authFeature = createAuthFeature(deps.db, {
-		...config.auth,
-		emailVerification: capabilities.emailVerification,
-	}, billingFeature.authPlugin ? [billingFeature.authPlugin] : []);
+	const authFeature = createAuthFeature(
+		deps.db,
+		{
+			...config.auth,
+			emailVerification: capabilities.emailVerification,
+		},
+		billingFeature.authPlugin ? [billingFeature.authPlugin] : [],
+	);
+	const sharingFeature = createSharingFeature({
+		db: deps.db,
+		policyReader: subscriptionFeature.policyReader,
+		invalidator: coordinatorProxyRepository,
+	}, {
+		baseURL: config.auth.baseURL,
+		billingBaseURL: config.billing?.wwwBaseUrl,
+		requireVerifiedEmail:
+			capabilities.emailVerification === "required" && !config.auth.devMode,
+		allowedEmails: config.auth.allowedEmails,
+		email: config.auth.email,
+		emailFrom: config.auth.emailFrom,
+	});
 	const syncAccessFeature = createSyncAccessFeature({
 		vaultService: vaultFeature.service,
+		accessReader: (userId, vaultId) => sharingFeature.access.require(userId, vaultId),
+		accessVerifier: async (claims, token) =>
+			coordinatorProxyRepository.authorizeSync(claims.vaultId, token, claims),
 		coordinatorNamespace: deps.coordinatorNamespace,
 		syncTokenSecret: config.syncTokenSecret,
 		syncTokenTtlSeconds: config.syncTokenTtlSeconds,
@@ -89,8 +115,10 @@ export function createApiApplication(
 		objectKeyBuilder: { blobObjectKey, blobObjectKeyPrefix },
 	});
 	return {
+		flushSharingRefreshes: () => sharingFeature.service.flushRefreshes(),
 		app: createApp(
 			{
+				sharing: sharingFeature.service,
 				authHttpHandler: authFeature.authHttpHandler,
 				sessionReader: authFeature.sessionReader,
 				syncTokenIssuer: syncAccessFeature.tokenIssuer,

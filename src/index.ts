@@ -1,8 +1,8 @@
-import { logServerError } from "./errors";
+import { logServerError } from "./platform/logging";
 import {
 	createQueueConsumer,
 	createRuntimeApp,
-	runVaultRetentionSchedule,
+	runScheduledTasks,
 } from "./runtime";
 import type { QueueMessage } from "./runtime";
 export { SyncCoordinator } from "./sync-coordinator/adapters/inbound/durable-object-rpc/sync-coordinator";
@@ -26,6 +26,6 @@ export default {
 		await createQueueConsumer(env).handleBatch(batch);
 	},
 	async scheduled(controller, env): Promise<void> {
-		await runVaultRetentionSchedule(env, controller.scheduledTime);
+		await runScheduledTasks(env, controller.cron, controller.scheduledTime);
 	},
 } satisfies ExportedHandler<Env, QueueMessage>;

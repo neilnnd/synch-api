@@ -1,3 +1,7 @@
+import type {
+	VerifiedVaultAccess,
+	VaultAccessDecision,
+} from "../../../application/services/sync-access-service";
 import { DurableObject } from "cloudflare:workers";
 import { apiError } from "../../../../errors";
 import type {
@@ -32,20 +36,34 @@ import {
 const ALARM_FAILURE_RETRY_MS = 30 * 1000;
 
 export class SyncCoordinator extends DurableObject {
+	private readonly authorizeVerified: ReturnType<
+		typeof createCoordinatorRuntime
+	>["authorizeSyncAccess"];
 	private readonly app: ReturnType<typeof createCoordinatorRuntime>["app"];
-	private readonly useCases: CoordinatorApplicationPort;
+	private readonly services: CoordinatorApplicationPort;
 	private readonly socketMessageHandler: CoordinatorSocketMessageHandler;
-	private readonly socketGateway: ReturnType<typeof createCoordinatorRuntime>["socketGateway"];
+	private readonly socketGateway: ReturnType<
+		typeof createCoordinatorRuntime
+	>["socketGateway"];
 	private readonly ready: Promise<void>;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		const runtime = createCoordinatorRuntime(ctx, env);
 		this.app = runtime.app;
-		this.useCases = runtime.useCases;
+		this.authorizeVerified = runtime.authorizeSyncAccess;
+		this.services = runtime.services;
 		this.socketMessageHandler = runtime.socketMessageHandler;
 		this.socketGateway = runtime.socketGateway;
 		this.ready = runtime.ready;
+	}
+
+	// This method is exposed only on the internal namespace binding, never HTTP.
+	async authorizeSyncAccess(
+		input: VerifiedVaultAccess,
+	): Promise<VaultAccessDecision> {
+		await this.ready;
+		return this.authorizeVerified(input);
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -58,7 +76,10 @@ export class SyncCoordinator extends DurableObject {
 		}
 	}
 
-	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+	async webSocketMessage(
+		ws: WebSocket,
+		message: string | ArrayBuffer,
+	): Promise<void> {
 		let connectionId: string | null = null;
 		try {
 			connectionId = this.socketGateway.connectionIdFor(ws);
@@ -106,7 +127,7 @@ export class SyncCoordinator extends DurableObject {
 		message: CommitMutationsMessage,
 	): Promise<CommitMutationsResult> {
 		return await this.withRpcError("commitMutations", () =>
-			this.useCases.commitMutations(session, message),
+			this.services.commitMutations(session, message),
 		);
 	}
 
@@ -115,7 +136,7 @@ export class SyncCoordinator extends DurableObject {
 		message: CommitMutationMessage,
 	): Promise<CommitMutationResult> {
 		return await this.withRpcError("commitMutation", () =>
-			this.useCases.commitMutation(session, message),
+			this.services.commitMutation(session, message),
 		);
 	}
 
@@ -124,7 +145,7 @@ export class SyncCoordinator extends DurableObject {
 		message: ListEntryStatesMessage,
 	): Promise<EntryStatesListedMessage> {
 		return await this.withRpcError("listEntryStates", async () =>
-			this.useCases.listEntryStates(session, message),
+			this.services.listEntryStates(session, message),
 		);
 	}
 
@@ -133,7 +154,7 @@ export class SyncCoordinator extends DurableObject {
 		message: ListEntryVersionsMessage,
 	): Promise<EntryVersionsListedMessage> {
 		return await this.withRpcError("listEntryVersions", () =>
-			this.useCases.listEntryVersions(session, message),
+			this.services.listEntryVersions(session, message),
 		);
 	}
 
@@ -142,7 +163,7 @@ export class SyncCoordinator extends DurableObject {
 		message: ListDeletedEntriesMessage,
 	): Promise<DeletedEntriesListedMessage> {
 		return await this.withRpcError("listDeletedEntries", () =>
-			this.useCases.listDeletedEntries(session, message),
+			this.services.listDeletedEntries(session, message),
 		);
 	}
 
@@ -151,7 +172,7 @@ export class SyncCoordinator extends DurableObject {
 		message: RestoreEntryVersionMessage,
 	): Promise<RestoreEntryVersionResult> {
 		return await this.withRpcError("restoreEntryVersion", () =>
-			this.useCases.restoreEntryVersion(session, message),
+			this.services.restoreEntryVersion(session, message),
 		);
 	}
 
@@ -160,7 +181,7 @@ export class SyncCoordinator extends DurableObject {
 		message: RestoreEntryVersionsMessage,
 	): Promise<RestoreEntryVersionsResult> {
 		return await this.withRpcError("restoreEntryVersions", () =>
-			this.useCases.restoreEntryVersions(session, message),
+			this.services.restoreEntryVersions(session, message),
 		);
 	}
 
@@ -169,32 +190,30 @@ export class SyncCoordinator extends DurableObject {
 		message: PurgeDeletedEntriesMessage,
 	): Promise<DeletedEntriesPurgeResult> {
 		return await this.withRpcError("purgeDeletedEntries", () =>
-			this.useCases.purgeDeletedEntries(session, message),
+			this.services.purgeDeletedEntries(session, message),
 		);
 	}
 
 	async runGc(): Promise<void> {
-		await this.withRpcError("runGc", () => this.useCases.runGc());
+		await this.withRpcError("runGc", () => this.services.runGc());
 	}
 
-	async repairSyncState(
-		vaultId: string,
-	): Promise<SyncRepairResult> {
+	async repairSyncState(vaultId: string): Promise<SyncRepairResult> {
 		return await this.withRpcError("repairSyncState", () =>
-			this.useCases.repairSyncState(vaultId),
+			this.services.repairSyncState(vaultId),
 		);
 	}
 
 	async flushHealthSummary(): Promise<void> {
 		await this.withRpcError("flushHealthSummary", () =>
-			this.useCases.flushHealthSummary(),
+			this.services.flushHealthSummary(),
 		);
 	}
 
 	async alarm(alarmInfo?: AlarmInvocationInfo): Promise<void> {
 		try {
 			await this.ready;
-			await this.useCases.handleAlarm();
+			await this.services.handleAlarm();
 		} catch (error) {
 			console.error("[sync-coordinator] durable object alarm failed", {
 				objectId: this.ctx.id.toString(),
@@ -204,15 +223,21 @@ export class SyncCoordinator extends DurableObject {
 			try {
 				const retryAt = Date.now() + ALARM_FAILURE_RETRY_MS;
 				await this.ctx.storage.setAlarm(retryAt);
-				console.error("[sync-coordinator] durable object alarm retry scheduled", {
-					objectId: this.ctx.id.toString(),
-					retryAt,
-				});
+				console.error(
+					"[sync-coordinator] durable object alarm retry scheduled",
+					{
+						objectId: this.ctx.id.toString(),
+						retryAt,
+					},
+				);
 			} catch (retryError) {
-				console.error("[sync-coordinator] durable object alarm retry scheduling failed", {
-					objectId: this.ctx.id.toString(),
-					error: formatLogError(retryError),
-				});
+				console.error(
+					"[sync-coordinator] durable object alarm retry scheduling failed",
+					{
+						objectId: this.ctx.id.toString(),
+						error: formatLogError(retryError),
+					},
+				);
 				throw error;
 			}
 		}
@@ -274,7 +299,7 @@ export class SyncCoordinator extends DurableObject {
 		}
 
 		try {
-			await this.useCases.handleSocketClose();
+			await this.services.handleSocketClose();
 		} catch (error) {
 			this.logError(operationName + ":cleanup", error);
 		}
@@ -311,7 +336,10 @@ function internalErrorResponse(): Response {
 	);
 }
 
-function formatRequestForLog(request: Request): { method: string; path: string } {
+function formatRequestForLog(request: Request): {
+	method: string;
+	path: string;
+} {
 	const url = new URL(request.url);
 	return {
 		method: request.method,
@@ -322,7 +350,11 @@ function formatRequestForLog(request: Request): { method: string; path: string }
 function mapCoordinatorRpcError(error: unknown): unknown {
 	if (!(error instanceof SyncCoordinatorApplicationError)) return error;
 	if (error.code === "sync_paused") {
-		return apiError(403, "forbidden", "vault sync is temporarily paused for repair");
+		return apiError(
+			503,
+			"sync_paused",
+			"vault sync is temporarily paused for repair",
+		);
 	}
 	return apiError(
 		rpcErrorStatus(error.code),
